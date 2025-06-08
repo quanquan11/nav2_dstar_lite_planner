@@ -1,64 +1,68 @@
-#ifndef NAV2_DSTAR_LITE_PLANNER__DSTAR_LITE_PLANNER_HPP_
-#define NAV2_DSTAR_LITE_PLANNER__DSTAR_LITE_PLANNER_HPP_
+// Copyright 2025 Lee Sheng Quan & contributors
+// SPDX‑License‑Identifier: Apache‑2.0
+//
+// D* Lite global‑planner header for ROS 2 Nav2.
+// Split out from the self‑contained example so that users
+// who prefer the traditional *.hpp + *.cpp* structure can include
+// this file in *include/nav2_dstar_lite_planner/* and keep the
+// implementation in *src/dstar_lite_planner.cpp*.
+//
+// See the companion implementation file for full algorithm details.
 
-#include <string>
+#pragma once
+
+#include <limits>
 #include <memory>
-#include <vector>
 #include <queue>
 #include <unordered_map>
+#include <utility>
 
-#include "rclcpp/rclcpp.hpp"
 #include "nav2_core/global_planner.hpp"
-#include "nav2_costmap_2d/costmap_2d_ros.hpp"
+#include "nav2_costmap_2d/costmap_2d.hpp"
 #include "tf2_ros/buffer.h"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/path.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
 
 namespace nav2_dstar_lite_planner
 {
 
-struct Node {
-  int x, y;
-  double g, rhs;
+//------------------------------------------------------------------------------
+//  Basic grid‑node container used by D* Lite.
+//------------------------------------------------------------------------------
+struct Node
+{
+  int x{0}, y{0};
+  float g{std::numeric_limits<float>::infinity()};
+  float rhs{std::numeric_limits<float>::infinity()};
 
-  bool operator==(const Node &other) const {
-    return x == other.x && y == other.y;
-  }
+  Node() = default;
+  Node(int _x, int _y) : x(_x), y(_y) {}
+  bool operator==(const Node & other) const {return x == other.x && y == other.y;}
+};
 
-  bool operator!=(const Node &other) const {
-    return !(*this == other);
+struct Key
+{
+  float k1{0.f}, k2{0.f};
+  bool operator<(const Key & o) const noexcept
+  {
+    return (k1 < o.k1) || (k1 == o.k1 && k2 < o.k2);
   }
 };
 
-struct Key {
-  double k1, k2;
-
-  bool operator<(const Key &other) const {
-    if (k1 == other.k1) return k2 < other.k2;
-    return k1 < other.k1;
-  }
-
-  bool operator>(const Key &other) const {
-    if (k1 == other.k1) return k2 > other.k2;
-    return k1 > other.k1;
-  }
-};
-
-// ✅ Custom comparator that compares only keys
-struct CompareKeys {
-  bool operator()(const std::pair<Key, Node> &a, const std::pair<Key, Node> &b) const {
-    return a.first > b.first;
-  }
-};
-
+//------------------------------------------------------------------------------
+//  Main planner class (interface identical to NavFnPlanner).
+//------------------------------------------------------------------------------
 class DStarLitePlanner : public nav2_core::GlobalPlanner
 {
 public:
   DStarLitePlanner() = default;
   ~DStarLitePlanner() override = default;
 
+  // ‑‑‑ Nav2 lifecycle hooks ‑‑‑ ------------------------------------------------
   void configure(
-    const rclcpp_lifecycle::LifecycleNode::WeakPtr &parent,
+    const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
     std::string name,
     std::shared_ptr<tf2_ros::Buffer> tf,
     std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros) override;
@@ -68,41 +72,54 @@ public:
   void deactivate() override;
 
   nav_msgs::msg::Path createPlan(
-    const geometry_msgs::msg::PoseStamped &start,
-    const geometry_msgs::msg::PoseStamped &goal) override;
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal) override;
 
-protected:
-  nav2_util::LifecycleNode::SharedPtr node_;
-  std::string name_;
-  std::string global_frame_;
-  nav2_costmap_2d::Costmap2D *costmap_;
-  std::shared_ptr<tf2_ros::Buffer> tf_;
+  // Optional: incremental updates when the global costmap publishes changes.
+  void onMapUpdate(const nav2_msgs::msg::Costmap & msg);
 
-  double interpolation_resolution_;
+private:
+  // Helpers --------------------------------------------------------------------
+  void initialiseSearch();
+  void updateVertex(int idx);
+  void computeShortestPath();
+  Key  calculateKey(int idx) const;
+  bool costIsLethal(uint8_t cost) const;
+  int  getBestSuccessor(int idx) const;
 
-  std::priority_queue<std::pair<Key, Node>,
-                      std::vector<std::pair<Key, Node>>,
-                      CompareKeys> open_list_;
+  // Conversion helpers (thin wrappers around Costmap2D methods).
+  bool worldToMap(double wx, double wy, unsigned int & mx, unsigned int & my) const;
+  void mapToWorld(unsigned int mx, unsigned int my, double & wx, double & wy) const;
 
-  std::unordered_map<int, std::unordered_map<int, Node>> node_map_;
+  // Members --------------------------------------------------------------------
+  std::shared_ptr<rclcpp_lifecycle::LifecycleNode> node_;
+  rclcpp::Logger logger_{rclcpp::get_logger("DStarLitePlanner")};
+  nav2_costmap_2d::Costmap2D * costmap_{nullptr};
 
-  Key calculateKey(const Node &node);
-  void insertOrUpdate(const Node &node, const Key &key);
-  std::vector<Node> getNeighbors(const Node &node);
-  double heuristic(const Node &a, const Node &b);
-  void updateVertex(const Node &node);
+  // Parameters (mirrored from NavFn for drop‑in replacement)
+  double interpolation_resolution_{0.0};  // 0 → no resampling (default NavFn behaviour)
+  double tolerance_{0.5};
+  bool   allow_unknown_{true};
+  bool   use_final_approach_orientation_{false};
+  int    lethal_cost_{253};
+  int    neutral_cost_{50};
+  double cost_factor_{0.8};
+  int    connectivity_{8};  // 4 or 8
+
+  // D* Lite state ----------------------------------------------------------------
+  float km_{0.f};
+  int   start_idx_{-1};
+  int   goal_idx_{-1};
+  std::unordered_map<int, Node> nodes_;           // flattened‑index → state
+  using PQElem = std::pair<Key,int>;              // (priority, index)
+  struct PQCmp { bool operator()(const PQElem & a, const PQElem & b) const {return b.first < a.first;} };
+  std::priority_queue<PQElem, std::vector<PQElem>, PQCmp> open_;  // min‑heap
+
+  // Cached size params for speed.
+  int size_x_{0};
+  int size_y_{0};
+  double resolution_{0.05};
+  double origin_x_{0.0}, origin_y_{0.0};
 };
 
-}  // namespace nav2_dstar_lite_planner
-
-// Provide a hash specialization for Node to avoid instantiation errors
-namespace std {
-template <>
-struct hash<nav2_dstar_lite_planner::Node> {
-  std::size_t operator()(const nav2_dstar_lite_planner::Node& node) const {
-    return hash<int>()(node.x) ^ (hash<int>()(node.y) << 1);
-  }
-};
-}
-
-#endif  // NAV2_DSTAR_LITE_PLANNER__DSTAR_LITE_PLANNER_HPP_
+} // namespace nav2_dstar_lite_planner
