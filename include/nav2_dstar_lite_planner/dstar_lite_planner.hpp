@@ -41,6 +41,13 @@ public:
     const geometry_msgs::msg::PoseStamped & start,
     const geometry_msgs::msg::PoseStamped & goal) override;
 
+  void notifyCostmapChanged();
+
+  // Dynamic update methods for D* Lite
+  void updateCostmapCell(unsigned int mx, unsigned int my, uint8_t new_cost);
+  void updateCostmapRegion(unsigned int min_x, unsigned int min_y, unsigned int max_x, unsigned int max_y);
+  void updateRobotPosition(const geometry_msgs::msg::PoseStamped& new_start);
+
 protected:
   // Grid indexing and transformation
   inline size_t index(unsigned int x, unsigned int y) const;
@@ -77,6 +84,7 @@ protected:
   void updateVertex(int idx);
   void computeShortestPath();
   std::vector<int> getSuccessors(int idx) const;
+  std::vector<int> getPredecessors(int idx) const;
 
   // Members
   rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
@@ -109,6 +117,18 @@ protected:
   std::vector<bool> in_open_;
   std::priority_queue<PQItem, std::vector<PQItem>, PQCmp> open_;
   std::unordered_map<int, Key> key_hash_;
+
+  // Caching for efficient plan reuse
+  geometry_msgs::msg::PoseStamped last_start_;
+  geometry_msgs::msg::PoseStamped last_goal_;
+  nav_msgs::msg::Path last_path_;
+  bool costmap_changed_ = true;
+  
+  // D* Lite state tracking
+  bool dstar_initialized_ = false;
+  int last_goal_idx_ = -1;
+  int last_start_idx_ = -1;
+  int prev_start_idx_ = -1;
 };
 
 }  // namespace nav2_dstar_lite_planner
