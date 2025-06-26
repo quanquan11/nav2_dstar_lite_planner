@@ -61,7 +61,6 @@ public:
 
     declare_parameter_if_not_declared(node_.lock(), name_ + ".neutral_cost", rclcpp::ParameterValue(50));
     node_.lock()->get_parameter(name_ + ".neutral_cost", neutral_cost_);
-    RCLCPP_INFO(node_logger_, "D* Lite: neutral_cost_ parameter value: %d", neutral_cost_);
 
     declare_parameter_if_not_declared(node_.lock(), name_ + ".cost_factor", rclcpp::ParameterValue(0.8));
     node_.lock()->get_parameter(name_ + ".cost_factor", cost_factor_);
@@ -166,16 +165,13 @@ public:
                               size_y_ != costmap_->getSizeInCellsY();
 
     if (need_initialization) {
-      std::string reason = !dstar_initialized_ ? "not initialized" :
-                           goal_idx_ != last_goal_idx_ ? "new goal" :
-                           (size_x_ != costmap_->getSizeInCellsX() || size_y_ != costmap_->getSizeInCellsY()) ? "costmap size changed" :
-                           "unknown";
-      RCLCPP_WARN(node_logger_, "D* Lite: FULL INITIALIZATION (reason: %s)", reason.c_str());
+      RCLCPP_INFO(node_logger_, "D* Lite: FULL INITIALIZATION (reason: %s)",
+                  !dstar_initialized_ ? "not initialized" :
+                  goal_idx_ != last_goal_idx_ ? "new goal" : "costmap size changed");
       initialiseDStar();
       dstar_initialized_ = true;
       last_goal_idx_ = goal_idx_;
       last_start_idx_ = start_idx_;
-      prev_start_idx_ = start_idx_;
     } else {
       // Use incremental updates - update robot position if it changed
       if (start_idx_ != last_start_idx_) {
@@ -206,6 +202,19 @@ public:
       throw std::runtime_error("D* Lite failed to find a path");
     }
 
+    // After extracting the path, check for non-traversable cells
+    bool path_has_obstacle = false;
+    for (size_t i = 0; i < grid_path.size(); ++i) {
+      int cell = grid_path[i];
+      if (!isTraversable(cell)) {
+        RCLCPP_WARN(node_logger_, "D* Lite: Path cell %d is not traversable (cost: %d)", cell, costmap_->getCharMap()[cell]);
+        path_has_obstacle = true;
+      }
+    }
+    if (path_has_obstacle) {
+      RCLCPP_ERROR(node_logger_, "D* Lite: WARNING - Planned path goes through obstacles!");
+    }
+
     for (size_t i = 0; i < grid_path.size(); ++i) {
       int cell = grid_path[i];
       geometry_msgs::msg::PoseStamped wp;
@@ -220,6 +229,34 @@ public:
       }
 
       path.poses.push_back(wp);
+    }
+
+    // Set the orientation of the first pose to point toward the second pose (if available)
+    if (path.poses.size() >= 2) {
+      auto & first = path.poses[0].pose.position;
+      auto & second = path.poses[1].pose.position;
+      double dx = second.x - first.x;
+      double dy = second.y - first.y;
+      double yaw = std::atan2(dy, dx);
+      path.poses[0].pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(yaw);
+    }
+
+    // Snap the first path pose to the robot's current pose if not already close
+    if (!path.poses.empty()) {
+      double dx = path.poses[0].pose.position.x - start.pose.position.x;
+      double dy = path.poses[0].pose.position.y - start.pose.position.y;
+      double dist = std::sqrt(dx*dx + dy*dy);
+      if (dist > resolution_ * 1.5) { // If the first path pose is not close to the robot
+        geometry_msgs::msg::PoseStamped robot_pose = start;
+        if (path.poses.size() >= 2) {
+          // Set orientation toward the next pose
+          auto & next = path.poses[1].pose.position;
+          double yaw = std::atan2(next.y - robot_pose.pose.position.y, next.x - robot_pose.pose.position.x);
+          robot_pose.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(yaw);
+        }
+        path.poses.insert(path.poses.begin(), robot_pose);
+        RCLCPP_INFO(node_logger_, "D* Lite: Inserted robot pose as first waypoint for smooth path start.");
+      }
     }
 
     // Handle final orientation
@@ -319,17 +356,20 @@ public:
       return;
     }
     int new_start_idx = index(new_sx, new_sy);
-    float hval = (prev_start_idx_ >= 0) ? heuristic(prev_start_idx_, new_start_idx) : 0.0f;
-    RCLCPP_WARN(node_logger_, "D* Lite: heuristic(%d, %d) = %.2f", prev_start_idx_, new_start_idx, hval);
     RCLCPP_INFO(node_logger_, "D* Lite: ROBOT POSITION UPDATE: %d -> %d (km: %.2f -> %.2f), world (%.3f, %.3f) -> grid (%u, %u)",
-                prev_start_idx_, new_start_idx, km_, km_ + hval,
+                start_idx_, new_start_idx, km_, km_ + heuristic(start_idx_, new_start_idx),
                 new_start.pose.position.x, new_start.pose.position.y, new_sx, new_sy);
-    if (prev_start_idx_ >= 0) {
-      km_ += hval;
+    
+    // Update km_ as per D* Lite algorithm
+    if (start_idx_ >= 0) {
+      km_ += heuristic(start_idx_, new_start_idx);
     }
-    prev_start_idx_ = new_start_idx;
+    
     start_idx_ = new_start_idx;
+    
+    // Update the new start vertex
     updateVertex(start_idx_);
+    
     RCLCPP_DEBUG(node_logger_, "D* Lite: Robot position updated to (%u, %u)", new_sx, new_sy);
   }
 
@@ -420,8 +460,14 @@ private:
   bool isTraversable(int idx) const
   {
     uint8_t c = costmap_->getCharMap()[idx];
-    if (c >= lethal_cost_) return false;
-    if (!allow_unknown_ && c == nav2_costmap_2d::NO_INFORMATION) return false;
+    if (c >= lethal_cost_) {
+      RCLCPP_DEBUG(node_logger_, "D* Lite: Cell %d is not traversable (lethal, cost: %d)", idx, c);
+      return false;
+    }
+    if (!allow_unknown_ && c == nav2_costmap_2d::NO_INFORMATION) {
+      RCLCPP_DEBUG(node_logger_, "D* Lite: Cell %d is not traversable (unknown)", idx);
+      return false;
+    }
     return true;
   }
 
@@ -456,7 +502,6 @@ private:
 
   void initialiseDStar()
   {
-    RCLCPP_WARN(node_logger_, "D* Lite: initialiseDStar() called, resetting km_ to 0");
     km_ = 0.0;
     std::fill(g_.begin(), g_.end(), INF_);
     std::fill(rhs_.begin(), rhs_.end(), INF_);
@@ -516,6 +561,17 @@ private:
 
       if (g_[top.idx] > rhs_[top.idx]) {
         g_[top.idx] = rhs_[top.idx];
+        // Set came_from_ to the best predecessor at this point
+        float min_rhs = INF_;
+        int best_pred = -1;
+        for (int s : getSuccessors(top.idx)) {
+          float val = traversalCost(top.idx, s) + g_[s];
+          if (val < min_rhs) {
+            min_rhs = val;
+            best_pred = s;
+          }
+        }
+        came_from_[top.idx] = best_pred;
         for (int p : getSuccessors(top.idx)) updateVertex(p);
       } else {
         g_[top.idx] = INF_;
@@ -585,7 +641,6 @@ private:
   bool dstar_initialized_ {false};
   int last_goal_idx_ {-1};
   int last_start_idx_ {-1};
-  int prev_start_idx_ {-1};
 };
 
 }  // namespace nav2_dstar_lite_planner
