@@ -8,6 +8,7 @@
 #include <queue>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
 
 #include "rclcpp/rclcpp.hpp"
 #include "nav2_core/global_planner.hpp"
@@ -88,6 +89,7 @@ public:
   nav_msgs::msg::Path createPlan(const geometry_msgs::msg::PoseStamped & start,
                                const geometry_msgs::msg::PoseStamped & goal) override
   {
+    auto planning_start = std::chrono::high_resolution_clock::now();
     // Log robot and goal world positions and grid indices
     unsigned int sx, sy, gx, gy;
     bool start_in_map = worldToMap(start.pose.position.x, start.pose.position.y, sx, sy);
@@ -239,11 +241,22 @@ public:
     }
 
     RCLCPP_INFO(node_logger_, "D* Lite: path with %zu points generated", path.poses.size());
-    // Cache the results
-    last_start_ = start;
-    last_goal_ = goal;
-    last_path_ = path;
-    costmap_changed_ = false;
+    
+    // Calculate metrics
+    auto planning_end = std::chrono::high_resolution_clock::now();
+    auto planning_duration = std::chrono::duration_cast<std::chrono::microseconds>(planning_end - planning_start);
+    double planning_time_ms = planning_duration.count() / 1000.0;
+    
+    // Calculate path length in meters
+    double path_length = 0.0;
+    for (size_t i = 1; i < path.poses.size(); ++i) {
+      double dx = path.poses[i].pose.position.x - path.poses[i-1].pose.position.x;
+      double dy = path.poses[i].pose.position.y - path.poses[i-1].pose.position.y;
+      path_length += std::sqrt(dx*dx + dy*dy);
+    }
+    
+    // Log metrics with units
+    RCLCPP_INFO(node_logger_, "METRICS: path_length=%.3fm | planning_time=%.2fms | waypoints=%zu", path_length, planning_time_ms, path.poses.size());
     RCLCPP_DEBUG(node_logger_, "D* Lite: Path cached for future reuse");
     return path;
   }
