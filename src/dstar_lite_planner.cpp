@@ -481,14 +481,12 @@ private:
     return cost;
   }
 
-  // Fix heuristic formula
-  float heuristic(int a, int b) const {
+  float heuristic(int a, int b) const
+  {
     int ax = a % size_x_, ay = a / size_x_;
     int bx = b % size_x_, by = b / size_x_;
     int dx = std::abs(ax - bx), dy = std::abs(ay - by);
-    float D = static_cast<float>(neutral_cost_);
-    float D2 = std::sqrt(2.0f) * D;
-    return D * (dx + dy) + (D2 - 2.0f * D) * std::min(dx, dy);
+    return neutral_cost_ * (dx + dy) + (std::sqrt(2.0f) - 2.0f * neutral_cost_) * std::min(dx, dy);
   }
 
   void allocateStructures()
