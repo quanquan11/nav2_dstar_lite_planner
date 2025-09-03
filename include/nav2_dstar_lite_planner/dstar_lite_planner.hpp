@@ -9,6 +9,7 @@
 #include <memory>
 #include <unordered_map>
 #include <queue>
+#include <chrono>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
@@ -172,6 +173,9 @@ private:
   int last_goal_idx_ {-1};
   int last_start_idx_ {-1};
   int prev_start_idx_ {-1};
+
+enum class PlanType { INITIAL, INCREMENTAL, REPLAN };
+PlanType last_plan_type_{PlanType::INITIAL};
 };
 
 }  // namespace nav2_dstar_lite_planner
