@@ -88,134 +88,42 @@ nav_msgs::msg::Path DStarLitePlanner::createPlan(const geometry_msgs::msg::PoseS
                                const geometry_msgs::msg::PoseStamped & goal)
 {
     auto planning_start = std::chrono::high_resolution_clock::now();
-    
-    // Fast path: check if we can reuse cached path
-    if (!costmap_changed_ && start == last_start_ && goal == last_goal_) {
-      return last_path_;
+
+    nav_msgs::msg::Path path;
+    if (checkCachedPath(start, goal, planning_start, path)) {
+      return path;
     }
 
-  nav_msgs::msg::Path path;
-  path.header.stamp    = clock_->now();
-  path.header.frame_id = frame_id_;
+    path.header.stamp    = clock_->now();
+    path.header.frame_id = frame_id_;
 
-    // Convert world coordinates to grid coordinates
-  unsigned int sx, sy, gx, gy;
-    bool start_in_map = worldToMap(start.pose.position.x, start.pose.position.y, sx, sy);
-    bool goal_in_map = worldToMap(goal.pose.position.x, goal.pose.position.y, gx, gy);
-
-    // Handle out-of-bounds goal with fallback
-    if (!start_in_map || !goal_in_map) {
-    bool found = false;
-    for (double dx = -tolerance_; dx <= tolerance_; dx += resolution_) {
-      for (double dy = -tolerance_; dy <= tolerance_; dy += resolution_) {
-        double x = goal.pose.position.x + dx;
-        double y = goal.pose.position.y + dy;
-        unsigned int mx, my;
-        if (worldToMap(x, y, mx, my)) {
-          if (isTraversable(index(mx, my))) {
-            gx = mx;
-            gy = my;
-            found = true;
-            break;
-          }
-        }
-      }
-      if (found) break;
-    }
-    if (!found) {
+    unsigned int sx, sy, gx, gy;
+    if (!validateAndConvertCoordinates(start, goal, sx, sy, gx, gy)) {
       throw std::runtime_error("Goal is out of bounds and no fallback found within tolerance.");
     }
-  }
 
-  start_idx_ = index(sx, sy);
-  goal_idx_  = index(gx, gy);
+    start_idx_ = index(sx, sy);
+    goal_idx_  = index(gx, gy);
 
-  // Special case: start == goal
-  if (start_idx_ == goal_idx_) {
-    path.poses.push_back(start);
-    if (!use_final_approach_orientation_) {
-      path.poses.back().pose.orientation = goal.pose.orientation;
-    }
-      
-      // Cache the results
-      last_start_ = start;
-      last_goal_ = goal;
-      last_path_ = path;
-      costmap_changed_ = false;
-      
-      auto planning_end = std::chrono::high_resolution_clock::now();
-      auto planning_duration = std::chrono::duration_cast<std::chrono::microseconds>(planning_end - planning_start);
-      double planning_time_ms = planning_duration.count() / 1000.0;
-      RCLCPP_INFO(node_logger_, "METRICS: path_length=0.000m | planning_time=%.2fms | waypoints=1 | start_equals_goal=true", planning_time_ms);
-    return path;
-  }
-
-    // Check if costmap size changed
-  if (size_x_ != costmap_->getSizeInCellsX() || size_y_ != costmap_->getSizeInCellsY()) {
-    size_x_ = costmap_->getSizeInCellsX();
-    size_y_ = costmap_->getSizeInCellsY();
-    allocateStructures();
-      dstar_initialized_ = false;
-  }
-
-    // Determine if full initialization is needed
-    bool need_initialization = !dstar_initialized_ || goal_idx_ != last_goal_idx_ ||
-                              size_x_ != costmap_->getSizeInCellsX() ||
-                              size_y_ != costmap_->getSizeInCellsY();
-
-    if (need_initialization) {
-      initialiseDStar();
-      dstar_initialized_ = true;
-      last_goal_idx_ = goal_idx_;
-      last_start_idx_ = start_idx_;
-      prev_start_idx_ = start_idx_;
-    } else if (start_idx_ != last_start_idx_) {
-      // Incremental update for robot movement
-      updateRobotPosition(start);
-      last_start_idx_ = start_idx_;
+    if (start_idx_ == goal_idx_) {
+      return handleStartEqualsGoal(start, goal, planning_start);
     }
 
-    // Compute shortest path
-  computeShortestPath();
+    updateCostmapSizeIfChanged();
+    performDStarPlanning(start);
 
-    // Extract path from grid
     std::vector<int> grid_path = extractPath();
     if (grid_path.empty()) {
-    throw std::runtime_error("D* Lite failed to find a path");
-  }
+      throw std::runtime_error("D* Lite failed to find a path");
+    }
 
-    // Convert grid path to world coordinates
     path = convertGridPathToWorld(grid_path, start, goal);
 
-    // Cache the results
-    last_start_ = start;
-    last_goal_ = goal;
-    last_path_ = path;
-    costmap_changed_ = false;
+    cacheResults(start, goal, path);
+    logPlanningMetrics(planning_start, path);
 
-    // Minimal logging for performance - only log if unusually slow
-    auto planning_end = std::chrono::high_resolution_clock::now();
-    auto planning_duration = std::chrono::duration_cast<std::chrono::microseconds>(planning_end - planning_start);
-    double planning_time_ms = planning_duration.count() / 1000.0;
-    
-    // Log ALL planning calls to track full navigation journey
-    double path_length = calculatePathLength(path);
-    
-    // Calculate distance to goal for progress tracking
-    double dist_to_goal = std::sqrt(
-      std::pow(goal.pose.position.x - start.pose.position.x, 2) +
-      std::pow(goal.pose.position.y - start.pose.position.y, 2)
-    );
-    
-    // Determine planning type for better insight
-    const char* plan_type = !dstar_initialized_ ? "INITIAL" : 
-                           (start_idx_ != last_start_idx_) ? "INCREMENTAL" : "REPLAN";
-    
-    RCLCPP_INFO(node_logger_, "METRICS [%s]: dist_to_goal=%.3fm | path_length=%.3fm | planning_time=%.2fms | waypoints=%zu | km=%.2f | iterations=%d", 
-                plan_type, dist_to_goal, path_length, planning_time_ms, path.poses.size(), km_, vertices_processed_);
-    
     return path;
-  }
+}
 
 void DStarLitePlanner::notifyCostmapChanged() {
     costmap_changed_ = true;
@@ -386,6 +294,18 @@ float DStarLitePlanner::heuristic(int a, int b) const {
     return h;
   }
 
+float DStarLitePlanner::heuristicCached(int a, int b) const
+  {
+    int key = (a << 16) ^ b;
+    auto it = heuristic_cache_.find(key);
+    if (it != heuristic_cache_.end()) {
+      return it->second;
+    }
+    float h = heuristic(a, b);
+    heuristic_cache_[key] = h;
+    return h;
+  }
+
 void DStarLitePlanner::allocateStructures()
   {
     size_t N = size_x_ * size_y_;
@@ -408,6 +328,140 @@ void DStarLitePlanner::allocateStructures()
       key_hash_.reserve(std::min(N / 50, static_cast<size_t>(10000)));
     }
   }
+
+bool DStarLitePlanner::checkCachedPath(
+  const geometry_msgs::msg::PoseStamped& start,
+  const geometry_msgs::msg::PoseStamped& goal,
+  std::chrono::high_resolution_clock::time_point planning_start,
+  nav_msgs::msg::Path& path)
+{
+  if (!costmap_changed_ && start == last_start_ && goal == last_goal_) {
+    path = last_path_;
+    path.header.stamp = clock_->now();
+    logPlanningMetrics(planning_start, path);
+    return true;
+  }
+  return false;
+}
+
+bool DStarLitePlanner::validateAndConvertCoordinates(
+  const geometry_msgs::msg::PoseStamped& start,
+  const geometry_msgs::msg::PoseStamped& goal,
+  unsigned int& sx, unsigned int& sy,
+  unsigned int& gx, unsigned int& gy)
+{
+  bool start_in_map = worldToMap(start.pose.position.x, start.pose.position.y, sx, sy);
+  bool goal_in_map = worldToMap(goal.pose.position.x, goal.pose.position.y, gx, gy);
+
+  if (!start_in_map || !goal_in_map) {
+    bool found = false;
+    for (double dx = -tolerance_; dx <= tolerance_ && !found; dx += resolution_) {
+      for (double dy = -tolerance_; dy <= tolerance_; dy += resolution_) {
+        double x = goal.pose.position.x + dx;
+        double y = goal.pose.position.y + dy;
+        unsigned int mx, my;
+        if (worldToMap(x, y, mx, my) && isTraversable(index(mx, my))) {
+          gx = mx;
+          gy = my;
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+nav_msgs::msg::Path DStarLitePlanner::handleStartEqualsGoal(
+  const geometry_msgs::msg::PoseStamped& start,
+  const geometry_msgs::msg::PoseStamped& goal,
+  std::chrono::high_resolution_clock::time_point planning_start)
+{
+  nav_msgs::msg::Path path;
+  path.header.stamp = clock_->now();
+  path.header.frame_id = frame_id_;
+  path.poses.push_back(start);
+  if (!use_final_approach_orientation_) {
+    path.poses.back().pose.orientation = goal.pose.orientation;
+  }
+  last_plan_type_ = PlanType::REPLAN;
+  cacheResults(start, goal, path);
+  logPlanningMetrics(planning_start, path);
+  return path;
+}
+
+void DStarLitePlanner::updateCostmapSizeIfChanged()
+{
+  if (size_x_ != costmap_->getSizeInCellsX() || size_y_ != costmap_->getSizeInCellsY()) {
+    size_x_ = costmap_->getSizeInCellsX();
+    size_y_ = costmap_->getSizeInCellsY();
+    allocateStructures();
+    dstar_initialized_ = false;
+  }
+}
+
+void DStarLitePlanner::performDStarPlanning(const geometry_msgs::msg::PoseStamped& start)
+{
+  bool need_initialization = !dstar_initialized_ || goal_idx_ != last_goal_idx_ ||
+                             size_x_ != costmap_->getSizeInCellsX() ||
+                             size_y_ != costmap_->getSizeInCellsY();
+
+  if (need_initialization) {
+    initialiseDStar();
+    dstar_initialized_ = true;
+    last_goal_idx_ = goal_idx_;
+    last_start_idx_ = start_idx_;
+    prev_start_idx_ = start_idx_;
+    last_plan_type_ = PlanType::INITIAL;
+  } else if (start_idx_ != last_start_idx_) {
+    updateRobotPosition(start);
+    last_start_idx_ = start_idx_;
+    last_plan_type_ = PlanType::INCREMENTAL;
+  } else {
+    last_plan_type_ = PlanType::REPLAN;
+  }
+
+  computeShortestPath();
+}
+
+void DStarLitePlanner::cacheResults(
+  const geometry_msgs::msg::PoseStamped& start,
+  const geometry_msgs::msg::PoseStamped& goal,
+  const nav_msgs::msg::Path& path)
+{
+  last_start_ = start;
+  last_goal_ = goal;
+  last_path_ = path;
+  costmap_changed_ = false;
+}
+
+void DStarLitePlanner::logPlanningMetrics(
+  std::chrono::high_resolution_clock::time_point planning_start,
+  const nav_msgs::msg::Path& path)
+{
+  auto planning_end = std::chrono::high_resolution_clock::now();
+  auto planning_duration =
+    std::chrono::duration_cast<std::chrono::microseconds>(planning_end - planning_start);
+  double planning_time_ms = planning_duration.count() / 1000.0;
+
+  double path_length = calculatePathLength(path);
+
+  double dist_to_goal = std::sqrt(
+    std::pow(last_goal_.pose.position.x - last_start_.pose.position.x, 2) +
+    std::pow(last_goal_.pose.position.y - last_start_.pose.position.y, 2));
+
+  const char* plan_type =
+    (last_plan_type_ == PlanType::INITIAL) ? "INITIAL" :
+    (last_plan_type_ == PlanType::INCREMENTAL) ? "INCREMENTAL" : "REPLAN";
+
+  RCLCPP_INFO(node_logger_,
+    "METRICS [%s]: dist_to_goal=%.3fm | path_length=%.3fm | planning_time=%.2fms | waypoints=%zu | km=%.2f | iterations=%d",
+    plan_type, dist_to_goal, path_length, planning_time_ms, path.poses.size(), km_, vertices_processed_);
+}
 
 void DStarLitePlanner::initialiseDStar()
   {
@@ -566,7 +620,7 @@ void DStarLitePlanner::computeShortestPath()
 Key DStarLitePlanner::calculateKey(int idx) const
   {
     float v = std::min(g_[idx], rhs_[idx]);
-    float h = heuristic(start_idx_, idx);
+    float h = heuristicCached(start_idx_, idx);
     Key key = {v + h + km_, v};
     
     // Log key calculation for goal vertex to validate D* Lite formula
