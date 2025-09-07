@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <queue>
 #include <chrono>
+#include <limits>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
@@ -73,7 +74,7 @@ private:
   void pushOpen(int idx, const Key & key);
 
   // Helper methods
-  inline size_t index(unsigned int x, unsigned int y) const;
+  inline int index(unsigned int x, unsigned int y) const;
   bool worldToMap(double wx, double wy, unsigned int & mx, unsigned int & my) const;
   void mapToWorld(unsigned int mx, unsigned int my, double & wx, double & wy) const;
   
@@ -135,6 +136,13 @@ private:
   double cost_factor_ {0.8};
   int connectivity_ {8};
   bool use_final_approach_orientation_ {false};
+  // Search effort tuning
+  double max_search_ratio_initial_ {0.5};      // fraction of map for initial plan
+  double max_search_ratio_incremental_ {0.2};  // fraction of map for incremental plan
+  // NavFn-inspired time slicing
+  double max_planning_time_ms_ {100.0};
+  int cycle_batch_size_ {256};
+  int terminal_check_interval_param_ {10};
 
   int start_idx_ {-1}, goal_idx_ {-1};
   float km_ {0.0};
@@ -147,7 +155,9 @@ private:
   
   // Performance optimization caches
   mutable std::vector<int> successor_cache_;
-  mutable std::unordered_map<int, float> heuristic_cache_;
+  // Fast per-cell heuristic cache keyed by idx for current start
+  mutable std::vector<float> heuristic_cache_vec_;
+  mutable int heuristic_cache_start_idx_ = -1;
   
   // Connectivity lookup tables (precomputed for performance)
   static constexpr int dx8_[8] = {1, 0, -1, 0, 1, 1, -1, -1};
@@ -158,6 +168,7 @@ private:
   std::vector<int> came_from_;
   std::priority_queue<PQItem, std::vector<PQItem>, PQCmp> open_;
   std::unordered_map<int, Key> key_hash_;
+  unsigned char * cmap_cache_ {nullptr};
   
   // NavFn-inspired priority management
   std::vector<std::vector<int>> priority_buffers_;

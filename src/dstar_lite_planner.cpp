@@ -66,9 +66,23 @@ void DStarLitePlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr 
     declare_parameter_if_not_declared(node, name_ + ".use_final_approach_orientation", rclcpp::ParameterValue(false));
     node->get_parameter(name_ + ".use_final_approach_orientation", use_final_approach_orientation_);
 
+    // Search tuning parameters
+    declare_parameter_if_not_declared(node, name_ + ".max_search_ratio_initial", rclcpp::ParameterValue(0.5));
+    node->get_parameter(name_ + ".max_search_ratio_initial", max_search_ratio_initial_);
+    declare_parameter_if_not_declared(node, name_ + ".max_search_ratio_incremental", rclcpp::ParameterValue(0.2));
+    node->get_parameter(name_ + ".max_search_ratio_incremental", max_search_ratio_incremental_);
+
     // Precompute constants for performance
     sqrt2_ = std::sqrt(2.0f);
     sqrt2_cost_ = sqrt2_ * neutral_cost_;
+
+    // NavFn-inspired time-slicing parameters
+    declare_parameter_if_not_declared(node, name_ + ".max_planning_time_ms", rclcpp::ParameterValue(100.0));
+    node->get_parameter(name_ + ".max_planning_time_ms", max_planning_time_ms_);
+    declare_parameter_if_not_declared(node, name_ + ".cycle_batch_size", rclcpp::ParameterValue(256));
+    node->get_parameter(name_ + ".cycle_batch_size", cycle_batch_size_);
+    declare_parameter_if_not_declared(node, name_ + ".terminal_check_interval", rclcpp::ParameterValue(10));
+    node->get_parameter(name_ + ".terminal_check_interval", terminal_check_interval_param_);
 
     RCLCPP_INFO(node_logger_, "D* Lite planner configured (grid: %u × %u, res: %.2f m)", size_x_, size_y_, resolution_);
 
@@ -78,15 +92,32 @@ void DStarLitePlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr 
     last_goal_idx_ = -1;
   }
 
-void DStarLitePlanner::activate() {}
+void DStarLitePlanner::activate() {
+  if (auto node = node_.lock()) {
+    RCLCPP_INFO(node_logger_, "D* Lite planner activated");
+  }
+}
 
-void DStarLitePlanner::deactivate() {}
+void DStarLitePlanner::deactivate() {
+  if (auto node = node_.lock()) {
+    RCLCPP_INFO(node_logger_, "D* Lite planner deactivated");
+  }
+}
 
-void DStarLitePlanner::cleanup() {}
+void DStarLitePlanner::cleanup() {
+  if (auto node = node_.lock()) {
+    RCLCPP_INFO(node_logger_, "D* Lite planner cleaned up");
+  }
+}
 
 nav_msgs::msg::Path DStarLitePlanner::createPlan(const geometry_msgs::msg::PoseStamped & start,
                                const geometry_msgs::msg::PoseStamped & goal)
 {
+    RCLCPP_INFO(node_logger_,
+      "createPlan called: start(%.3f, %.3f) goal(%.3f, %.3f) frame=%s map=%ux%u res=%.3f",
+      start.pose.position.x, start.pose.position.y,
+      goal.pose.position.x, goal.pose.position.y,
+      frame_id_.c_str(), size_x_, size_y_, resolution_);
     auto planning_start = std::chrono::high_resolution_clock::now();
 
     nav_msgs::msg::Path path;
@@ -97,19 +128,30 @@ nav_msgs::msg::Path DStarLitePlanner::createPlan(const geometry_msgs::msg::PoseS
     path.header.stamp    = clock_->now();
     path.header.frame_id = frame_id_;
 
+    // Ensure we are using the latest costmap dimensions before any world->map checks
+    updateCostmapSizeIfChanged();
+    // Cache the underlying charmap pointer for hot loops in this planning call
+    cmap_cache_ = costmap_->getCharMap();
+
     unsigned int sx, sy, gx, gy;
     if (!validateAndConvertCoordinates(start, goal, sx, sy, gx, gy)) {
-      throw std::runtime_error("Goal is out of bounds and no fallback found within tolerance.");
+      throw std::runtime_error("Start/Goal is out of bounds and no fallback found within tolerance.");
     }
 
     start_idx_ = index(sx, sy);
     goal_idx_  = index(gx, gy);
 
+    // Trace chosen grid cells and costs
+    uint8_t sc = costmap_->getCharMap()[start_idx_];
+    uint8_t gc = costmap_->getCharMap()[goal_idx_];
+    RCLCPP_INFO(node_logger_, "Pinned cells: start_idx=%d(cost=%u) goal_idx=%d(cost=%u)",
+                static_cast<int>(start_idx_), static_cast<unsigned>(sc),
+                static_cast<int>(goal_idx_), static_cast<unsigned>(gc));
+
     if (start_idx_ == goal_idx_) {
       return handleStartEqualsGoal(start, goal, planning_start);
     }
 
-    updateCostmapSizeIfChanged();
     performDStarPlanning(start);
 
     std::vector<int> grid_path = extractPath();
@@ -172,21 +214,26 @@ void DStarLitePlanner::updateRobotPosition(const geometry_msgs::msg::PoseStamped
     }
     
     int new_start_idx = index(new_sx, new_sy);
-    float hval = (prev_start_idx_ >= 0) ? heuristic(prev_start_idx_, new_start_idx) : 0.0f;
     
-    if (prev_start_idx_ >= 0) {
+    // FIXED: Correct D* Lite km update: km = km + h(s_last, s_start)
+    // This should be heuristic FROM last start TO current start
+    if (prev_start_idx_ >= 0 && prev_start_idx_ != new_start_idx) {
+      float hval = heuristic(prev_start_idx_, new_start_idx);
       km_ += hval;
-      RCLCPP_INFO(node_logger_, "D*LITE VALIDATION: Robot moved! km increased by %.3f (total km=%.3f) - PROVES incremental replanning", 
-                  hval, km_);
+      RCLCPP_INFO(node_logger_, "D*LITE: Robot moved from %d to %d, km increased by %.3f (total km=%.3f)", 
+                  prev_start_idx_, new_start_idx, hval, km_);
     }
     
-    prev_start_idx_ = new_start_idx;
-    start_idx_ = new_start_idx;
-    updateVertex(start_idx_);
+    // Update positions
+    prev_start_idx_ = start_idx_;  // Store current as previous
+    start_idx_ = new_start_idx;    // Update to new position
+    
+    // No need to updateVertex(start_idx_) here - D* Lite maintains queue from before
 }
 
-inline size_t DStarLitePlanner::index(unsigned int x, unsigned int y) const { 
-  return y * size_x_ + x; 
+inline int DStarLitePlanner::index(unsigned int x, unsigned int y) const {
+  // Safe integer index computation
+  return static_cast<int>(y) * static_cast<int>(size_x_) + static_cast<int>(x);
 }
 
 bool DStarLitePlanner::worldToMap(double wx, double wy, unsigned int & mx, unsigned int & my) const
@@ -205,8 +252,9 @@ void DStarLitePlanner::mapToWorld(unsigned int mx, unsigned int my, double & wx,
 
 std::vector<int> DStarLitePlanner::getSuccessors(int idx) const
   {
-    unsigned int x = idx % size_x_;
-    unsigned int y = idx / size_x_;
+    int sx = static_cast<int>(size_x_);
+    int x = idx % sx;
+    int y = idx / sx;
     std::vector<int> nbrs;
     nbrs.reserve(8); // Pre-allocate for 8-connectivity
     
@@ -220,19 +268,38 @@ std::vector<int> DStarLitePlanner::getSuccessors(int idx) const
       int nx = static_cast<int>(x) + dx4[k];
       int ny = static_cast<int>(y) + dy4[k];
       if (nx >= 0 && ny >= 0 && nx < static_cast<int>(size_x_) && ny < static_cast<int>(size_y_)) {
-        int nidx = index(nx, ny);
+        int nidx = index(static_cast<unsigned int>(nx), static_cast<unsigned int>(ny));
         if (isTraversable(nidx)) nbrs.push_back(nidx);
       }
     }
     
-    // 8-connected neighbors
+    // 8-connected neighbors with NavFn-style no corner-cutting
     if (connectivity_ == 8) {
       for (int k = 0; k < 4; ++k) {
         int nx = static_cast<int>(x) + dx8[k];
         int ny = static_cast<int>(y) + dy8[k];
         if (nx >= 0 && ny >= 0 && nx < static_cast<int>(size_x_) && ny < static_cast<int>(size_y_)) {
-          int nidx = index(nx, ny);
-          if (isTraversable(nidx)) nbrs.push_back(nidx);
+          int nidx = index(static_cast<unsigned int>(nx), static_cast<unsigned int>(ny));
+          // require adjacent cardinals to be traversable to avoid cutting corners
+          bool ok = false;
+          if (nx > static_cast<int>(x) && ny > static_cast<int>(y)) {
+            // down-right: need right and down
+            ok = isTraversable(index(static_cast<unsigned int>(x + 1), static_cast<unsigned int>(y))) &&
+                 isTraversable(index(static_cast<unsigned int>(x), static_cast<unsigned int>(y + 1)));
+          } else if (nx < static_cast<int>(x) && ny > static_cast<int>(y)) {
+            // down-left: need left and down
+            ok = isTraversable(index(static_cast<unsigned int>(x - 1), static_cast<unsigned int>(y))) &&
+                 isTraversable(index(static_cast<unsigned int>(x), static_cast<unsigned int>(y + 1)));
+          } else if (nx > static_cast<int>(x) && ny < static_cast<int>(y)) {
+            // up-right: need right and up
+            ok = isTraversable(index(static_cast<unsigned int>(x + 1), static_cast<unsigned int>(y))) &&
+                 isTraversable(index(static_cast<unsigned int>(x), static_cast<unsigned int>(y - 1)));
+          } else if (nx < static_cast<int>(x) && ny < static_cast<int>(y)) {
+            // up-left: need left and up
+            ok = isTraversable(index(static_cast<unsigned int>(x - 1), static_cast<unsigned int>(y))) &&
+                 isTraversable(index(static_cast<unsigned int>(x), static_cast<unsigned int>(y - 1)));
+          }
+          if (ok && isTraversable(nidx)) nbrs.push_back(nidx);
         }
       }
     }
@@ -245,42 +312,52 @@ std::vector<int> DStarLitePlanner::getPredecessors(int idx) const {
 
 bool DStarLitePlanner::isTraversable(int idx) const
   {
-    uint8_t c = costmap_->getCharMap()[idx];
+    // Bounds guard
+    int N = static_cast<int>(size_x_ * size_y_);
+    if (idx < 0 || idx >= N) return false;
+
+    uint8_t c = cmap_cache_ ? cmap_cache_[idx] : costmap_->getCharMap()[idx];
     if (c >= lethal_cost_) return false;
     if (!allow_unknown_ && c == nav2_costmap_2d::NO_INFORMATION) return false;
     return true;
   }
 
 float DStarLitePlanner::getCostMultiplier(int idx) const {
-    uint8_t cost = costmap_->getCharMap()[idx];
-    
-    // NavFn-style cost handling
+    uint8_t cost = cmap_cache_ ? cmap_cache_[idx] : costmap_->getCharMap()[idx];
+
+    // NavFn-style cost policy
     if (cost == nav2_costmap_2d::NO_INFORMATION && allow_unknown_) {
-      return neutral_cost_;
+      return static_cast<float>(neutral_cost_);
     }
-    
     if (cost >= lethal_cost_) {
-      return 1e6; // High but finite cost instead of INF_ for better convergence
+      return 1e6f; // effectively blocked
     }
-    
-    // Normalize cost to prevent plateaus near obstacles
-    return neutral_cost_ + cost_factor_ * static_cast<float>(cost - neutral_cost_);
+
+    // Keep free space at neutral cost; scale only above neutral
+    if (cost <= neutral_cost_) {
+      return static_cast<float>(neutral_cost_);
+    }
+
+    return static_cast<float>(neutral_cost_) + static_cast<float>(cost_factor_) *
+           static_cast<float>(cost - neutral_cost_);
   }
 
 float DStarLitePlanner::traversalCost(int idx_from, int idx_to) const
   {
     float cost = getCostMultiplier(idx_to);
     
-    unsigned int x1 = idx_from % size_x_, y1 = idx_from / size_x_;
-    unsigned int x2 = idx_to % size_x_, y2 = idx_to / size_x_;
+    int sx = static_cast<int>(size_x_);
+    int x1 = idx_from % sx, y1 = idx_from / sx;
+    int x2 = idx_to % sx, y2 = idx_to / sx;
     
     if (x1 != x2 && y1 != y2) cost *= sqrt2_;
     return cost;
   }
 
 float DStarLitePlanner::heuristic(int a, int b) const {
-    int ax = a % size_x_, ay = a / size_x_;
-    int bx = b % size_x_, by = b / size_x_;
+    int sx = static_cast<int>(size_x_);
+    int ax = a % sx, ay = a / sx;
+    int bx = b % sx, by = b / sx;
     int dx = std::abs(ax - bx), dy = std::abs(ay - by);
     
     // NavFn-inspired: slightly optimistic heuristic for faster initial search
@@ -296,13 +373,15 @@ float DStarLitePlanner::heuristic(int a, int b) const {
 
 float DStarLitePlanner::heuristicCached(int a, int b) const
   {
-    int key = (a << 16) ^ b;
-    auto it = heuristic_cache_.find(key);
-    if (it != heuristic_cache_.end()) {
-      return it->second;
+    // a is expected to be current start_idx_ in this planner
+    if (heuristic_cache_start_idx_ != a || heuristic_cache_vec_.size() != size_x_ * size_y_) {
+      heuristic_cache_vec_.assign(size_x_ * size_y_, -1.0f);
+      heuristic_cache_start_idx_ = a;
     }
+    float v = heuristic_cache_vec_[b];
+    if (v >= 0.0f) return v;
     float h = heuristic(a, b);
-    heuristic_cache_[key] = h;
+    heuristic_cache_vec_[b] = h;
     return h;
   }
 
@@ -319,7 +398,8 @@ void DStarLitePlanner::allocateStructures()
       
       // Pre-allocate performance optimization structures
       successor_cache_.reserve(8);
-      heuristic_cache_.reserve(std::min(N / 100, static_cast<size_t>(5000)));
+      heuristic_cache_vec_.assign(N, -1.0f);
+      heuristic_cache_start_idx_ = -1;
       
       // Clear priority queue efficiently
       std::priority_queue<PQItem, std::vector<PQItem>, PQCmp> empty;
@@ -350,29 +430,114 @@ bool DStarLitePlanner::validateAndConvertCoordinates(
   unsigned int& sx, unsigned int& sy,
   unsigned int& gx, unsigned int& gy)
 {
-  bool start_in_map = worldToMap(start.pose.position.x, start.pose.position.y, sx, sy);
-  bool goal_in_map = worldToMap(goal.pose.position.x, goal.pose.position.y, gx, gy);
+  // Log costmap bounds and inputs once to aid debugging
+  const double origin_x = costmap_->getOriginX();
+  const double origin_y = costmap_->getOriginY();
+  const double world_max_x = origin_x + size_x_ * resolution_;
+  const double world_max_y = origin_y + size_y_ * resolution_;
 
-  if (!start_in_map || !goal_in_map) {
-    bool found = false;
-    for (double dx = -tolerance_; dx <= tolerance_ && !found; dx += resolution_) {
-      for (double dy = -tolerance_; dy <= tolerance_; dy += resolution_) {
-        double x = goal.pose.position.x + dx;
-        double y = goal.pose.position.y + dy;
-        unsigned int mx, my;
-        if (worldToMap(x, y, mx, my) && isTraversable(index(mx, my))) {
-          gx = mx;
-          gy = my;
-          found = true;
-          break;
+  auto log_bounds_once = [&]() {
+    RCLCPP_WARN_ONCE(
+      node_logger_,
+      "Costmap bounds: origin(%.3f, %.3f) size(%u x %u) res=%.3f -> world[%.3f..%.3f, %.3f..%.3f]; start(%.3f, %.3f) goal(%.3f, %.3f) tol=%.3f",
+      origin_x, origin_y, size_x_, size_y_, resolution_,
+      origin_x, world_max_x, origin_y, world_max_y,
+      start.pose.position.x, start.pose.position.y,
+      goal.pose.position.x, goal.pose.position.y,
+      tolerance_);
+  };
+
+  bool start_in_map = worldToMap(start.pose.position.x, start.pose.position.y, sx, sy);
+  bool goal_in_map  = worldToMap(goal.pose.position.x,  goal.pose.position.y,  gx, gy);
+
+  if (start_in_map && goal_in_map) {
+    // If either start or goal lands on an occupied cell, try to pin to nearest free
+    auto pin_if_blocked = [&](unsigned int& mx, unsigned int& my) {
+      int idx = index(mx, my);
+      if (isTraversable(idx)) return true;
+      const double step = std::max(0.5 * resolution_, 0.01);
+      for (double r = step; r <= tolerance_; r += step) {
+        for (double dx = -r; dx <= r; dx += step) {
+          for (double dy = -r; dy <= r; dy += step) {
+            unsigned int tx, ty;
+            if (worldToMap(costmap_->getOriginX() + (mx + 0.5) * resolution_ + dx,
+                           costmap_->getOriginY() + (my + 0.5) * resolution_ + dy, tx, ty)) {
+              int tidx = index(tx, ty);
+              if (isTraversable(tidx)) { mx = tx; my = ty; return true; }
+            }
+          }
+        }
+      }
+      return false;
+    };
+
+    bool ok_start = pin_if_blocked(sx, sy);
+    bool ok_goal  = pin_if_blocked(gx, gy);
+    if (!ok_start || !ok_goal) {
+      RCLCPP_ERROR(node_logger_, "Failed to pin %s within tolerance of %.2f m",
+                   (!ok_start ? "start" : "goal"), tolerance_);
+      return false;
+    }
+    return true;
+  }
+
+  // Helper to find a nearby valid cell around a world coordinate
+  auto find_fallback = [&](double wx, double wy, unsigned int& mx, unsigned int& my) -> bool {
+    const double step = std::max(0.5 * resolution_, 0.01);
+    for (double dx = -tolerance_; dx <= tolerance_; dx += step) {
+      for (double dy = -tolerance_; dy <= tolerance_; dy += step) {
+        unsigned int tx, ty;
+        if (worldToMap(wx + dx, wy + dy, tx, ty)) {
+          int tidx = index(tx, ty);
+          if (isTraversable(tidx)) { mx = tx; my = ty; return true; }
         }
       }
     }
-    if (!found) {
+    return false;
+  };
+
+  // Adjust start if needed
+  if (!start_in_map) {
+    log_bounds_once();
+    if (!find_fallback(start.pose.position.x, start.pose.position.y, sx, sy)) {
+      RCLCPP_ERROR(node_logger_, "Start is out of costmap bounds and no fallback found within tolerance");
       return false;
     }
+    RCLCPP_WARN(node_logger_, "Adjusted start to nearby valid cell inside costmap");
   }
 
+  // Adjust goal if needed
+  if (!goal_in_map) {
+    log_bounds_once();
+    if (!find_fallback(goal.pose.position.x, goal.pose.position.y, gx, gy)) {
+      RCLCPP_ERROR(node_logger_, "Goal is out of costmap bounds and no fallback found within tolerance");
+      return false;
+    }
+    RCLCPP_WARN(node_logger_, "Adjusted goal to nearby valid cell inside costmap");
+  }
+
+  // Final pinning for in-bounds case where cells might be occupied
+  auto pin_if_blocked2 = [&](unsigned int& mx, unsigned int& my, const char* label) {
+    int idx = index(mx, my);
+    if (isTraversable(idx)) return true;
+    const double step = std::max(0.5 * resolution_, 0.01);
+    for (double r = step; r <= tolerance_; r += step) {
+      for (double dx = -r; dx <= r; dx += step) {
+        for (double dy = -r; dy <= r; dy += step) {
+          unsigned int tx, ty;
+          if (worldToMap(costmap_->getOriginX() + (mx + 0.5) * resolution_ + dx,
+                         costmap_->getOriginY() + (my + 0.5) * resolution_ + dy, tx, ty)) {
+            int tidx = index(tx, ty);
+            if (isTraversable(tidx)) { mx = tx; my = ty; return true; }
+          }
+        }
+      }
+    }
+    RCLCPP_ERROR(node_logger_, "Could not pin %s to a free cell within tolerance", label);
+    return false;
+  };
+  if (!pin_if_blocked2(sx, sy, "start")) return false;
+  if (!pin_if_blocked2(gx, gy, "goal")) return false;
   return true;
 }
 
@@ -399,6 +564,9 @@ void DStarLitePlanner::updateCostmapSizeIfChanged()
   if (size_x_ != costmap_->getSizeInCellsX() || size_y_ != costmap_->getSizeInCellsY()) {
     size_x_ = costmap_->getSizeInCellsX();
     size_y_ = costmap_->getSizeInCellsY();
+    // Also refresh resolution and cached frame id in case map changed
+    resolution_ = costmap_->getResolution();
+    frame_id_ = costmap_ros_->getGlobalFrameID();
     allocateStructures();
     dstar_initialized_ = false;
   }
@@ -406,11 +574,20 @@ void DStarLitePlanner::updateCostmapSizeIfChanged()
 
 void DStarLitePlanner::performDStarPlanning(const geometry_msgs::msg::PoseStamped& start)
 {
-  bool need_initialization = !dstar_initialized_ || goal_idx_ != last_goal_idx_ ||
-                             size_x_ != costmap_->getSizeInCellsX() ||
-                             size_y_ != costmap_->getSizeInCellsY();
+  bool first_call = !dstar_initialized_;
+  bool new_goal = goal_idx_ != last_goal_idx_;
+  bool map_changed = size_x_ != costmap_->getSizeInCellsX() ||
+                     size_y_ != costmap_->getSizeInCellsY();
+
+  // FIXED: Only reinitialize for new goals or map changes, NOT empty queues or rhs values
+  bool need_initialization = first_call || new_goal || map_changed;
 
   if (need_initialization) {
+    RCLCPP_INFO(node_logger_,
+      "D*LITE REINIT: first=%s new_goal=%s map_changed=%s",
+      first_call ? "YES" : "NO",
+      new_goal ? "YES" : "NO",
+      map_changed ? "YES" : "NO");
     initialiseDStar();
     dstar_initialized_ = true;
     last_goal_idx_ = goal_idx_;
@@ -490,8 +667,10 @@ void DStarLitePlanner::updateVertex(int idx)
       float min_rhs = INF_;
       int best_pred = -1;
       
-      for (int s : getSuccessors(idx)) {
-        float val = traversalCost(idx, s) + g_[s];
+      // Use predecessors for backwards D* Lite search from goal
+      std::vector<int> preds = getPredecessors(idx);
+      for (int s : preds) {
+        float val = traversalCost(s, idx) + g_[s];
         if (val < min_rhs) {
           min_rhs = val;
           best_pred = s;
@@ -517,42 +696,40 @@ void DStarLitePlanner::updateVertex(int idx)
 void DStarLitePlanner::computeShortestPath()
   {
     vertices_processed_ = 0;
-    
-    // NavFn-inspired dynamic limits: max(nx*ny/20, nx+ny)
-    int max_iterations = std::max(static_cast<int>(size_x_ * size_y_ / 20), 
-                                 static_cast<int>(size_x_ + size_y_));
-    
-    // For incremental searches, be even more conservative
-    if (dstar_initialized_) {
-      max_iterations = std::max(static_cast<int>(size_x_ * size_y_ / 50), 
-                               static_cast<int>(size_x_ + size_y_));
-    }
-    
-    // Pre-compute start key for efficiency
-    Key start_key = calculateKey(start_idx_);
-    const int terminal_check_interval = 50; // NavFn-style: check every N cycles
-    
-    while (!open_.empty()) {
-      // Standard D* Lite termination: start must be reachable AND consistent
-      if (g_[start_idx_] < INF_ && rhs_[start_idx_] == g_[start_idx_]) {
-        Key current_top_key = open_.top().key;
-        if (!(current_top_key < start_key)) {
-          break;
-        }
-      }
+    auto t_start = std::chrono::steady_clock::now();
+
+    // FIXED: Remove artificial iteration limits - let D* Lite run to natural convergence
+    // Only keep safety timeout to prevent infinite loops in case of bugs
+    const int safety_max_iterations = static_cast<int>(size_x_ * size_y_ * 2); // 2x map size as safety
+    const double safety_timeout_ms = 5000.0; // 5 second safety timeout
+
+    // Standard D* Lite loop condition: run until start is locally consistent and expanded
+    auto loop_cond = [&]() -> bool {
+      if (open_.empty()) return false;
+      Key top_key = open_.top().key;
+      Key start_key = calculateKey(start_idx_);
+      return (top_key < start_key) || (rhs_[start_idx_] != g_[start_idx_]);
+    };
+
+    while (loop_cond()) {
+      ++vertices_processed_;
       
-      // NavFn-style: check termination only every N cycles for performance
-      if (vertices_processed_ % terminal_check_interval == 0 && vertices_processed_ > 0) {
-        // Early termination if start is reachable and consistent
-        if (g_[start_idx_] < INF_ && rhs_[start_idx_] == g_[start_idx_]) {
-          break;
-        }
-      }
-      
-      if (++vertices_processed_ > max_iterations) {
-        RCLCPP_WARN(node_logger_, "D* Lite: Exceeded %d iterations (%.1f%% of map)", 
-                    max_iterations, (100.0 * vertices_processed_) / (size_x_ * size_y_));
+      // Safety checks only - not artificial limits
+      if (vertices_processed_ > safety_max_iterations) {
+        RCLCPP_ERROR(node_logger_, "D* Lite SAFETY: Exceeded %d iterations - possible infinite loop bug", 
+                     safety_max_iterations);
         break;
+      }
+      
+      // Safety timeout check
+      if (vertices_processed_ % 1000 == 0) {
+        auto t_now = std::chrono::steady_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(t_now - t_start).count();
+        if (elapsed_ms > safety_timeout_ms) {
+          RCLCPP_ERROR(node_logger_, "D* Lite SAFETY: Exceeded %.0f ms timeout - possible infinite loop bug", 
+                       safety_timeout_ms);
+          break;
+        }
       }
       
       PQItem top = open_.top();
@@ -579,8 +756,8 @@ void DStarLitePlanner::computeShortestPath()
           RCLCPP_DEBUG(node_logger_, "D*LITE CONSISTENCY: Start vertex made consistent (g=rhs=%.2f) - PROVES two-value convergence", g_[top.idx]);
         }
         
-        // Use cached successors for performance
-        getSuccessorsOptimized(top.idx, successor_cache_);
+        // Update predecessors of u
+        getSuccessorsOptimized(top.idx, successor_cache_); // grid is symmetric; successors=predecessors
         for (int pred : successor_cache_) {
           updateVertex(pred);
         }
@@ -589,19 +766,13 @@ void DStarLitePlanner::computeShortestPath()
         g_[top.idx] = INF_;
         updateVertex(top.idx);
         
-        getSuccessorsOptimized(top.idx, successor_cache_);
+        getSuccessorsOptimized(top.idx, successor_cache_); // predecessors
         for (int pred : successor_cache_) {
           updateVertex(pred);
         }
       }
     }
-    
-    // Minimal debug output for performance
-    if (vertices_processed_ > max_iterations * 0.8) {
-      RCLCPP_DEBUG(node_logger_, "SEARCH COMPLETE: processed %d vertices (%.1f%% of map)", 
-                   vertices_processed_, (100.0 * vertices_processed_) / (size_x_ * size_y_));
-    }
-    
+
     if (g_[start_idx_] == INF_) {
         RCLCPP_ERROR(node_logger_, "SEARCH FAILED: Start vertex unreachable after %d iterations", vertices_processed_);
         
@@ -660,23 +831,33 @@ std::vector<int> DStarLitePlanner::extractPath() const {
     size_t guard = 0;
     const size_t max_path_length = size_x_ * size_y_;
 
-    // Build path from start to goal following came_from pointers
+    // Build path from start to goal following came_from pointers, with greedy fallback
     while (current != goal_idx_ && guard++ < max_path_length) {
       grid_path.push_back(current);
-      
+
       int next = came_from_[current];
       if (next < 0 || next >= static_cast<int>(size_x_ * size_y_)) {
-          RCLCPP_ERROR(node_logger_, "PATH EXTRACTION: Invalid next vertex %d at step %zu (current=%d)", 
-                       next, guard, current);
+        // Greedy fallback: choose neighbor minimizing g[n] + traversalCost(current,n)
+        getSuccessorsOptimized(current, successor_cache_);
+        float best_val = INF_;
+        int best_n = -1;
+        for (int n : successor_cache_) {
+          float val = g_[n] + traversalCost(current, n);
+          if (val < best_val) { best_val = val; best_n = n; }
+        }
+        if (best_n < 0) {
+          RCLCPP_ERROR(node_logger_, "PATH EXTRACTION: No valid neighbor from %d at step %zu", current, guard);
           break;
+        }
+        next = best_n;
       }
-      
+
       // Check for loops
       if (next == current) {
-          RCLCPP_ERROR(node_logger_, "PATH EXTRACTION: Loop detected at vertex %d", current);
-          break;
+        RCLCPP_ERROR(node_logger_, "PATH EXTRACTION: Loop detected at vertex %d", current);
+        break;
       }
-      
+
       current = next;
     }
     
@@ -705,8 +886,9 @@ nav_msgs::msg::Path DStarLitePlanner::convertGridPathToWorld(const std::vector<i
       geometry_msgs::msg::PoseStamped wp;
       wp.header = path.header;
       
-      unsigned int mx = cell % size_x_;
-      unsigned int my = cell / size_x_;
+      int sx = static_cast<int>(size_x_);
+      unsigned int mx = static_cast<unsigned int>(cell % sx);
+      unsigned int my = static_cast<unsigned int>(cell / sx);
       mapToWorld(mx, my, wp.pose.position.x, wp.pose.position.y);
 
       if (i == 0) {
@@ -746,14 +928,16 @@ void DStarLitePlanner::getSuccessorsOptimized(int idx, std::vector<int>& nbrs) c
     nbrs.clear();
     
     // NavFn-style optimization: batch boundary checks
-    unsigned int x = idx % size_x_;
-    unsigned int y = idx / size_x_;
+    int sx = static_cast<int>(size_x_);
+    int sy = static_cast<int>(size_y_);
+    int x = idx % sx;
+    int y = idx / sx;
     
     // Pre-compute boundary conditions
     bool can_go_left = x > 0;
-    bool can_go_right = x < size_x_ - 1;
+    bool can_go_right = x < sx - 1;
     bool can_go_up = y > 0;
-    bool can_go_down = y < size_y_ - 1;
+    bool can_go_down = y < sy - 1;
     
     // 4-connected neighbors with minimal computation
     if (can_go_right) {
@@ -761,7 +945,7 @@ void DStarLitePlanner::getSuccessorsOptimized(int idx, std::vector<int>& nbrs) c
         if (isTraversable(nidx)) nbrs.push_back(nidx);
     }
     if (can_go_down) {
-        int nidx = idx + size_x_;
+        int nidx = idx + sx;
         if (isTraversable(nidx)) nbrs.push_back(nidx);
     }
     if (can_go_left) {
@@ -769,27 +953,31 @@ void DStarLitePlanner::getSuccessorsOptimized(int idx, std::vector<int>& nbrs) c
         if (isTraversable(nidx)) nbrs.push_back(nidx);
     }
     if (can_go_up) {
-        int nidx = idx - size_x_;
+        int nidx = idx - sx;
         if (isTraversable(nidx)) nbrs.push_back(nidx);
     }
     
-    // 8-connected diagonals (only if 8-connectivity enabled)
+    // 8-connected diagonals (only if 8-connectivity enabled) with no corner-cutting
     if (connectivity_ == 8) {
         if (can_go_right && can_go_down) {
-            int nidx = idx + size_x_ + 1;
-            if (isTraversable(nidx)) nbrs.push_back(nidx);
+            int nidx = idx + sx + 1;
+            // require both cardinals free: right and down
+            if (isTraversable(idx + 1) && isTraversable(idx + sx) && isTraversable(nidx)) nbrs.push_back(nidx);
         }
         if (can_go_left && can_go_down) {
-            int nidx = idx + size_x_ - 1;
-            if (isTraversable(nidx)) nbrs.push_back(nidx);
+            int nidx = idx + sx - 1;
+            // require both cardinals free: left and down
+            if (isTraversable(idx - 1) && isTraversable(idx + sx) && isTraversable(nidx)) nbrs.push_back(nidx);
         }
         if (can_go_right && can_go_up) {
-            int nidx = idx - size_x_ + 1;
-            if (isTraversable(nidx)) nbrs.push_back(nidx);
+            int nidx = idx - sx + 1;
+            // require both cardinals free: right and up
+            if (isTraversable(idx + 1) && isTraversable(idx - sx) && isTraversable(nidx)) nbrs.push_back(nidx);
         }
         if (can_go_left && can_go_up) {
-            int nidx = idx - size_x_ - 1;
-            if (isTraversable(nidx)) nbrs.push_back(nidx);
+            int nidx = idx - sx - 1;
+            // require both cardinals free: left and up
+            if (isTraversable(idx - 1) && isTraversable(idx - sx) && isTraversable(nidx)) nbrs.push_back(nidx);
         }
     }
 }
