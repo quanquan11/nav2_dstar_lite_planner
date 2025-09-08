@@ -169,6 +169,11 @@ nav_msgs::msg::Path DStarLitePlanner::createPlan(const geometry_msgs::msg::PoseS
 
 void DStarLitePlanner::notifyCostmapChanged() {
     costmap_changed_ = true;
+    
+    // ENHANCED: Detect and process changed cells for proper D* Lite replanning
+    if (dstar_initialized_) {
+      detectAndProcessChangedCells();
+    }
   }
 
 void DStarLitePlanner::updateCostmapCell(unsigned int mx, unsigned int my, uint8_t new_cost) {
@@ -205,6 +210,52 @@ void DStarLitePlanner::updateCostmapRegion(unsigned int min_x, unsigned int min_
     }
     
     computeShortestPath();
+  }
+
+void DStarLitePlanner::detectAndProcessChangedCells() {
+    if (!dstar_initialized_) return;
+    
+    size_t map_size = size_x_ * size_y_;
+    unsigned char* current_costmap = costmap_->getCharMap();
+    
+    // Initialize previous costmap cache if needed
+    if (previous_costmap_.size() != map_size) {
+      previous_costmap_.assign(current_costmap, current_costmap + map_size);
+      return; // First call, just cache
+    }
+    
+    int changes_detected = 0;
+    std::vector<int> changed_cells;
+    
+    // Compare current costmap with cached version
+    for (size_t i = 0; i < map_size; ++i) {
+      if (current_costmap[i] != previous_costmap_[i]) {
+        changed_cells.push_back(static_cast<int>(i));
+        changes_detected++;
+      }
+    }
+    
+    if (changes_detected > 0) {
+      RCLCPP_INFO(node_logger_, "D*LITE OBSTACLE DETECTION: %d cells changed - triggering replanning", changes_detected);
+      
+      // Process each changed cell with D* Lite updates
+      for (int idx : changed_cells) {
+        // Update the vertex and its predecessors
+        updateVertex(idx);
+        
+        // Also update neighbors that might be affected
+        std::vector<int> preds = getPredecessors(idx);
+        for (int pred : preds) {
+          updateVertex(pred);
+        }
+      }
+      
+      // Update the cache for next comparison
+      std::copy(current_costmap, current_costmap + map_size, previous_costmap_.begin());
+      
+      RCLCPP_INFO(node_logger_, "D*LITE OBSTACLE PROCESSING: Updated %d vertices, queue size: %zu", 
+                  static_cast<int>(changed_cells.size() + changed_cells.size() * 8), open_.size());
+    }
   }
 
 void DStarLitePlanner::updateRobotPosition(const geometry_msgs::msg::PoseStamped& new_start) {
@@ -401,6 +452,9 @@ void DStarLitePlanner::allocateStructures()
       heuristic_cache_vec_.assign(N, -1.0f);
       heuristic_cache_start_idx_ = -1;
       
+      // Initialize costmap change detection cache
+      previous_costmap_.assign(N, 0);
+      
       // Clear priority queue efficiently
       std::priority_queue<PQItem, std::vector<PQItem>, PQCmp> empty;
       open_.swap(empty);
@@ -581,6 +635,11 @@ void DStarLitePlanner::performDStarPlanning(const geometry_msgs::msg::PoseStampe
 
   // FIXED: Only reinitialize for new goals or map changes, NOT empty queues or rhs values
   bool need_initialization = first_call || new_goal || map_changed;
+
+  // ENHANCED: Check for obstacle changes before planning
+  if (!need_initialization && dstar_initialized_) {
+    detectAndProcessChangedCells();
+  }
 
   if (need_initialization) {
     RCLCPP_INFO(node_logger_,

@@ -170,6 +170,10 @@ private:
   std::unordered_map<int, Key> key_hash_;
   unsigned char * cmap_cache_ {nullptr};
   
+  // Costmap change detection for dynamic replanning
+  std::vector<uint8_t> previous_costmap_;
+  void detectAndProcessChangedCells();
+  
   // NavFn-inspired priority management
   std::vector<std::vector<int>> priority_buffers_;
   int current_priority_level_;
